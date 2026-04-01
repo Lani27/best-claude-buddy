@@ -327,6 +327,7 @@ const { values: args } = parseArgs({
     shiny:       { type: "boolean", default: undefined },
     scan:        { type: "string", default: "50000000" },
     threads:     { type: "string" },
+    perfect:     { type: "boolean", default: false },
     "dry-run":   { type: "boolean", default: false },
     list:        { type: "boolean", default: false },
     current:     { type: "boolean", default: false },
@@ -363,6 +364,7 @@ if (args.help) {
   ${chalk.bold("Options:")}
     --scan <number>        Salts to scan (default: 50,000,000)
     --threads <number>     Worker threads for parallel scan (default: CPU cores)
+    --perfect              Scan forever until theoretical max stats are found (Ctrl+C to stop)
     --dry-run              Show best result without patching the binary
     --list                 Show all available options
     --current              Show current companion and stats
@@ -481,15 +483,34 @@ if (args.shiny !== undefined) target.shiny = args.shiny;
 
 const companionName = args.name ?? null;
 const companionPersonality = args.personality ? args.personality.slice(0, 200) : null;
-const scanLimit = parseInt(args.scan, 10) || 50_000_000;
+const perfectMode = args.perfect;
 const maxThreads = parseInt(args.threads, 10) || (navigator.hardwareConcurrency ?? require("os").cpus().length);
 const dryRun = args["dry-run"];
+
+// Calculate theoretical max total for the target rarity
+const targetRarity = target.rarity ?? "legendary";
+const targetFloor = RARITY_FLOOR[targetRarity];
+const maxPeak = Math.min(100, targetFloor + 50 + 29);
+const maxDump = Math.max(1, targetFloor - 10 + 14);
+const maxOther = targetFloor + 39;
+const theoreticalMax = maxPeak + maxDump + maxOther * 3;
+
+// In perfect mode: scan in batches of 50M until max is found
+// Otherwise: use --scan value
+const scanBatchSize = parseInt(args.scan, 10) || 50_000_000;
+const scanLimit = perfectMode ? Infinity : scanBatchSize;
 
 const targetDesc = Object.entries(target).map(([k, v]) => `${k}=${v}`).join("  ");
 console.log(chalk.bold("  Target:  ") + targetDesc);
 if (companionName) console.log(chalk.bold("  Name:    ") + chalk.yellowBright(companionName));
 if (companionPersonality) console.log(chalk.bold("  Persona: ") + chalk.italic(companionPersonality));
-console.log(chalk.bold("  Scan:    ") + `${scanLimit.toLocaleString()} salts across ${chalk.bold(maxThreads)} threads` + (dryRun ? chalk.yellow(" (dry run)") : ""));
+if (perfectMode) {
+  console.log(chalk.bold("  Mode:    ") + chalk.magentaBright(`PERFECT — hunting for ${theoreticalMax} total (theoretical max)`));
+  console.log(chalk.bold("  Scan:    ") + `unlimited, ${chalk.bold(maxThreads)} threads, ${scanBatchSize.toLocaleString()} per batch` + chalk.dim(" (Ctrl+C to stop with best so far)"));
+} else {
+  console.log(chalk.bold("  Scan:    ") + `${scanBatchSize.toLocaleString()} salts across ${chalk.bold(maxThreads)} threads` + (dryRun ? chalk.yellow(" (dry run)") : ""));
+}
+console.log(chalk.dim(`  Max possible: ${theoreticalMax} (peak:${maxPeak} + dump:${maxDump} + other:${maxOther}×3)`));
 console.log();
 
 // ── Multithreaded scan ─────────────────────────────────────────────────
@@ -545,13 +566,18 @@ function matches(roll, target) {
   return true;
 }
 
-parentPort.on("message", ({ startIdx, endIdx, userId, target, saltLen }) => {
+let stopped = false;
+parentPort.on("message", (msg) => {
+  if (msg.type === "stop") { stopped = true; return; }
+
+  const { startIdx, endIdx, userId, target, saltLen } = msg;
   const top10 = [];
   let matchCount = 0;
   let checked = 0;
   let lastReport = Date.now();
 
   for (let i = startIdx; i < endIdx; i++) {
+    if (stopped) break;
     const salt = String(i).padStart(saltLen, "x");
     checked++;
     const r = rollFrom(salt, userId);
@@ -585,70 +611,108 @@ const { Worker } = await import("worker_threads");
 const workerBlob = new Blob([workerCode], { type: "application/javascript" });
 const workerUrl = URL.createObjectURL(workerBlob);
 
-const chunkSize = Math.ceil(scanLimit / maxThreads);
-const workers = [];
-const results = [];
+let top10 = [];
 let totalChecked = 0;
 let totalMatches = 0;
 let globalBest = 0;
-let doneCount = 0;
+let perfectFound = false;
+let interrupted = false;
 const startTime = Date.now();
 
-await new Promise((resolve) => {
-  for (let t = 0; t < maxThreads; t++) {
-    const startIdx = t * chunkSize;
-    const endIdx = Math.min(startIdx + chunkSize, scanLimit);
-    if (startIdx >= scanLimit) { doneCount++; if (doneCount >= maxThreads) resolve(); continue; }
-
-    const w = new Worker(workerUrl);
-    workers.push(w);
-
-    w.on("message", (msg) => {
-      if (msg.type === "best") {
-        if (msg.total > globalBest) {
-          globalBest = msg.total;
-          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-          console.log(chalk.green(`  ▲ NEW BEST`) + chalk.dim(` [thread ${t}, ${elapsed}s]`) + ` total=${chalk.bold(msg.total)}`);
-          console.log(chalk.dim(`    ${msg.result.species} | eye:${msg.result.eye} | hat:${msg.result.hat} | peak:${msg.result.peak} | dump:${msg.result.dump}${msg.result.shiny ? " | shiny" : ""}`));
-        }
-      } else if (msg.type === "progress") {
-        // Periodic progress from worker — aggregate on done
-      } else if (msg.type === "done") {
-        results.push(msg);
-        totalChecked += msg.checked;
-        totalMatches += msg.matchCount;
-        doneCount++;
-
-        if (doneCount >= maxThreads || doneCount >= workers.length + (maxThreads - workers.length)) {
-          resolve();
-        }
-      }
-    });
-
-    w.on("error", (err) => {
-      console.error(`  ✗ Worker ${t} error:`, err.message);
-      doneCount++;
-      if (doneCount >= maxThreads) resolve();
-    });
-
-    w.postMessage({ startIdx, endIdx, userId, target, saltLen: SALT_LEN });
-  }
+// Graceful Ctrl+C — stop scanning and use best result so far
+process.on("SIGINT", () => {
+  if (interrupted) process.exit(1); // second Ctrl+C = force quit
+  interrupted = true;
+  console.log(chalk.yellow("\n\n  ⚠ Interrupted — stopping workers and using best result so far...\n"));
 });
 
-// Clean up workers
-for (const w of workers) w.terminate();
+async function runBatch(batchStart, batchSize) {
+  const chunkSize = Math.ceil(batchSize / maxThreads);
+  const workers = [];
+  const results = [];
+  let doneCount = 0;
+
+  return new Promise((resolve) => {
+    for (let t = 0; t < maxThreads; t++) {
+      const startIdx = batchStart + t * chunkSize;
+      const endIdx = Math.min(startIdx + chunkSize, batchStart + batchSize);
+      if (startIdx >= batchStart + batchSize) { doneCount++; if (doneCount >= maxThreads) resolve({ results, workers }); continue; }
+
+      const w = new Worker(workerUrl);
+      workers.push(w);
+
+      w.on("message", (msg) => {
+        if (msg.type === "best") {
+          if (msg.total > globalBest) {
+            globalBest = msg.total;
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+            const totalSoFar = totalChecked + results.reduce((s, r) => s + r.checked, 0) + msg.checked;
+            console.log(chalk.green(`  ▲ NEW BEST`) + chalk.dim(` [${totalSoFar.toLocaleString()} checked, ${elapsed}s]`) + ` total=${chalk.bold(msg.total)}` + (perfectMode ? chalk.dim(` / ${theoreticalMax}`) : ""));
+            console.log(chalk.dim(`    ${msg.result.species} | eye:${msg.result.eye} | hat:${msg.result.hat} | peak:${msg.result.peak} | dump:${msg.result.dump}${msg.result.shiny ? " | shiny" : ""}`));
+            if (perfectMode && msg.total >= theoreticalMax) {
+              perfectFound = true;
+              console.log(chalk.magentaBright.bold(`\n  ★ PERFECT ROLL FOUND! ★\n`));
+              // Stop all workers
+              for (const wk of workers) wk.postMessage({ type: "stop" });
+            }
+          }
+        } else if (msg.type === "done") {
+          results.push(msg);
+          doneCount++;
+          if (doneCount >= workers.length) resolve({ results, workers });
+        }
+      });
+
+      w.on("error", (err) => {
+        console.error(`  ✗ Worker error:`, err.message);
+        doneCount++;
+        if (doneCount >= workers.length) resolve({ results, workers });
+      });
+
+      // Send stop if already interrupted
+      if (interrupted) w.postMessage({ type: "stop" });
+      w.postMessage({ startIdx, endIdx, userId, target, saltLen: SALT_LEN });
+    }
+  });
+}
+
+// Run scan — single batch or loop until perfect
+let batchNum = 0;
+while (!perfectFound && !interrupted) {
+  const batchStart = batchNum * scanBatchSize;
+  const batchSize = perfectMode ? scanBatchSize : Math.min(scanBatchSize, scanLimit - batchStart);
+
+  if (!perfectMode && batchStart >= scanLimit) break;
+
+  if (perfectMode && batchNum > 0) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const rate = (totalChecked / ((Date.now() - startTime) / 1000) / 1_000_000).toFixed(1);
+    console.log(chalk.dim(`  ... ${totalChecked.toLocaleString()} checked, ${totalMatches.toLocaleString()} matches, best=${globalBest}/${theoreticalMax}, ${elapsed}s, ${rate}M/s`));
+  }
+
+  const { results, workers } = await runBatch(batchStart, batchSize);
+
+  for (const r of results) {
+    totalChecked += r.checked;
+    totalMatches += r.matchCount;
+    top10.push(...r.top10);
+  }
+  top10.sort((a, b) => b.total - a.total);
+  top10 = top10.slice(0, 10);
+
+  // Clean up workers
+  for (const w of workers) w.terminate();
+
+  batchNum++;
+
+  // Single batch mode — done after one pass
+  if (!perfectMode) break;
+}
+
 URL.revokeObjectURL(workerUrl);
 
-// Merge top 10 from all workers
-let top10 = [];
-for (const r of results) {
-  top10.push(...r.top10);
-}
-top10.sort((a, b) => b.total - a.total);
-top10 = top10.slice(0, 10);
-
 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-const rate = (totalChecked / ((Date.now() - startTime) / 1000) / 1_000_000).toFixed(1);
+const rate = totalChecked > 0 ? (totalChecked / ((Date.now() - startTime) / 1000) / 1_000_000).toFixed(1) : "0";
 
 if (totalMatches === 0) {
   console.error(`\n  ✗ No matches found in ${totalChecked.toLocaleString()} salts (${elapsed}s, ${rate}M/s).`);
