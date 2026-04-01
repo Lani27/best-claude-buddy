@@ -326,6 +326,7 @@ const { values: args } = parseArgs({
     personality: { type: "string" },
     shiny:       { type: "boolean", default: undefined },
     scan:        { type: "string", default: "50000000" },
+    threads:     { type: "string" },
     "dry-run":   { type: "boolean", default: false },
     list:        { type: "boolean", default: false },
     current:     { type: "boolean", default: false },
@@ -361,6 +362,7 @@ if (args.help) {
 
   ${chalk.bold("Options:")}
     --scan <number>        Salts to scan (default: 50,000,000)
+    --threads <number>     Worker threads for parallel scan (default: CPU cores)
     --dry-run              Show best result without patching the binary
     --list                 Show all available options
     --current              Show current companion and stats
@@ -480,64 +482,186 @@ if (args.shiny !== undefined) target.shiny = args.shiny;
 const companionName = args.name ?? null;
 const companionPersonality = args.personality ? args.personality.slice(0, 200) : null;
 const scanLimit = parseInt(args.scan, 10) || 50_000_000;
+const maxThreads = parseInt(args.threads, 10) || (navigator.hardwareConcurrency ?? require("os").cpus().length);
 const dryRun = args["dry-run"];
 
 const targetDesc = Object.entries(target).map(([k, v]) => `${k}=${v}`).join("  ");
 console.log(chalk.bold("  Target:  ") + targetDesc);
 if (companionName) console.log(chalk.bold("  Name:    ") + chalk.yellowBright(companionName));
 if (companionPersonality) console.log(chalk.bold("  Persona: ") + chalk.italic(companionPersonality));
-console.log(chalk.bold("  Scan:    ") + `${scanLimit.toLocaleString()} salts` + (dryRun ? chalk.yellow(" (dry run)") : ""));
+console.log(chalk.bold("  Scan:    ") + `${scanLimit.toLocaleString()} salts across ${chalk.bold(maxThreads)} threads` + (dryRun ? chalk.yellow(" (dry run)") : ""));
 console.log();
 
-// ── Scan ────────────────────────────────────────────────────────────────
+// ── Multithreaded scan ─────────────────────────────────────────────────
 
-const top10 = [];
-let matchCount = 0;
-let checked = 0;
-const startTime = Date.now();
+const workerCode = `
+const { parentPort } = require("worker_threads");
 
-for (let i = 0; i < scanLimit; i++) {
-  const salt = String(i).padStart(SALT_LEN, "x");
-  checked++;
-  const r = rollFrom(salt, userId);
+const RARITIES = ["common", "uncommon", "rare", "epic", "legendary"];
+const RARITY_WEIGHTS = { common: 60, uncommon: 25, rare: 10, epic: 4, legendary: 1 };
+const RARITY_TOTAL = 100;
+const RARITY_FLOOR = { common: 5, uncommon: 15, rare: 25, epic: 35, legendary: 50 };
+const SPECIES = ["duck","goose","blob","cat","dragon","octopus","owl","penguin","turtle","snail","ghost","axolotl","capybara","cactus","robot","rabbit","mushroom","chonk"];
+const EYES = ["\\u00b7","\\u2726","\\u00d7","\\u25c9","@","\\u00b0"];
+const HATS = ["none","crown","tophat","propeller","halo","wizard","beanie","tinyduck"];
+const STAT_NAMES = ["DEBUGGING","PATIENCE","CHAOS","WISDOM","SNARK"];
 
-  if (!matches(r, target)) continue;
-  matchCount++;
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function hashString(s) { return Number(BigInt(Bun.hash(s)) & 0xffffffffn); }
+function pick(rng, arr) { return arr[Math.floor(rng() * arr.length)]; }
+function rollRarity(rng) { let roll = rng() * RARITY_TOTAL; for (const r of RARITIES) { roll -= RARITY_WEIGHTS[r]; if (roll < 0) return r; } return "common"; }
 
-  const total = Object.values(r.stats).reduce((a, b) => a + b, 0);
+function rollFrom(salt, userId) {
+  const rng = mulberry32(hashString(userId + salt));
+  const rarity = rollRarity(rng);
+  const species = pick(rng, SPECIES);
+  const eye = pick(rng, EYES);
+  const hat = rarity === "common" ? "none" : pick(rng, HATS);
+  const shiny = rng() < 0.01;
+  const floor = RARITY_FLOOR[rarity];
+  const peak = pick(rng, STAT_NAMES);
+  let dump = pick(rng, STAT_NAMES);
+  while (dump === peak) dump = pick(rng, STAT_NAMES);
+  const stats = {};
+  for (const name of STAT_NAMES) {
+    if (name === peak) stats[name] = Math.min(100, floor + 50 + Math.floor(rng() * 30));
+    else if (name === dump) stats[name] = Math.max(1, floor - 10 + Math.floor(rng() * 15));
+    else stats[name] = floor + Math.floor(rng() * 40);
+  }
+  return { rarity, species, eye, hat, shiny, stats, peak, dump };
+}
 
-  if (top10.length < 10 || total > top10[top10.length - 1].total) {
-    top10.push({ salt, total, ...r });
-    top10.sort((a, b) => b.total - a.total);
-    if (top10.length > 10) top10.pop();
+function matches(roll, target) {
+  if (target.species && roll.species !== target.species) return false;
+  if (target.rarity && roll.rarity !== target.rarity) return false;
+  if (target.eye && roll.eye !== target.eye) return false;
+  if (target.hat && roll.hat !== target.hat) return false;
+  if (target.shiny !== undefined && roll.shiny !== target.shiny) return false;
+  if (target.peak && roll.peak !== target.peak) return false;
+  if (target.dump && roll.dump !== target.dump) return false;
+  return true;
+}
 
-    if (top10[0].salt === salt) {
-      // New #1
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(chalk.green(`  ▲ NEW BEST`) + chalk.dim(` [${matchCount} matches, ${checked.toLocaleString()} checked, ${elapsed}s]`) + ` total=${chalk.bold(total)}`);
-      console.log(chalk.dim(`    ${r.species} | eye:${r.eye} | hat:${r.hat} | peak:${r.peak} | dump:${r.dump}${r.shiny ? " | shiny" : ""}`));
+parentPort.on("message", ({ startIdx, endIdx, userId, target, saltLen }) => {
+  const top10 = [];
+  let matchCount = 0;
+  let checked = 0;
+  let lastReport = Date.now();
+
+  for (let i = startIdx; i < endIdx; i++) {
+    const salt = String(i).padStart(saltLen, "x");
+    checked++;
+    const r = rollFrom(salt, userId);
+    if (!matches(r, target)) continue;
+    matchCount++;
+    const total = Object.values(r.stats).reduce((a, b) => a + b, 0);
+
+    if (top10.length < 10 || total > top10[top10.length - 1].total) {
+      top10.push({ salt, total, ...r });
+      top10.sort((a, b) => b.total - a.total);
+      if (top10.length > 10) top10.pop();
+
+      if (top10[0].salt === salt) {
+        parentPort.postMessage({ type: "best", total, result: r, salt, matchCount, checked });
+      }
+    }
+
+    const now = Date.now();
+    if (now - lastReport > 3000) {
+      parentPort.postMessage({ type: "progress", checked, matchCount });
+      lastReport = now;
     }
   }
 
-  if (checked % 10_000_000 === 0) {
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    const rate = (checked / ((Date.now() - startTime) / 1000) / 1_000_000).toFixed(1);
-    console.log(chalk.dim(`  ... ${(checked / 1_000_000).toFixed(0)}M checked, ${matchCount} matches, ${elapsed}s, ${rate}M/s`));
+  parentPort.postMessage({ type: "done", top10, matchCount, checked });
+});
+`;
+
+const { Worker } = await import("worker_threads");
+
+const workerBlob = new Blob([workerCode], { type: "application/javascript" });
+const workerUrl = URL.createObjectURL(workerBlob);
+
+const chunkSize = Math.ceil(scanLimit / maxThreads);
+const workers = [];
+const results = [];
+let totalChecked = 0;
+let totalMatches = 0;
+let globalBest = 0;
+let doneCount = 0;
+const startTime = Date.now();
+
+await new Promise((resolve) => {
+  for (let t = 0; t < maxThreads; t++) {
+    const startIdx = t * chunkSize;
+    const endIdx = Math.min(startIdx + chunkSize, scanLimit);
+    if (startIdx >= scanLimit) { doneCount++; if (doneCount >= maxThreads) resolve(); continue; }
+
+    const w = new Worker(workerUrl);
+    workers.push(w);
+
+    w.on("message", (msg) => {
+      if (msg.type === "best") {
+        if (msg.total > globalBest) {
+          globalBest = msg.total;
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+          console.log(chalk.green(`  ▲ NEW BEST`) + chalk.dim(` [thread ${t}, ${elapsed}s]`) + ` total=${chalk.bold(msg.total)}`);
+          console.log(chalk.dim(`    ${msg.result.species} | eye:${msg.result.eye} | hat:${msg.result.hat} | peak:${msg.result.peak} | dump:${msg.result.dump}${msg.result.shiny ? " | shiny" : ""}`));
+        }
+      } else if (msg.type === "progress") {
+        // Periodic progress from worker — aggregate on done
+      } else if (msg.type === "done") {
+        results.push(msg);
+        totalChecked += msg.checked;
+        totalMatches += msg.matchCount;
+        doneCount++;
+
+        if (doneCount >= maxThreads || doneCount >= workers.length + (maxThreads - workers.length)) {
+          resolve();
+        }
+      }
+    });
+
+    w.on("error", (err) => {
+      console.error(`  ✗ Worker ${t} error:`, err.message);
+      doneCount++;
+      if (doneCount >= maxThreads) resolve();
+    });
+
+    w.postMessage({ startIdx, endIdx, userId, target, saltLen: SALT_LEN });
   }
+});
+
+// Clean up workers
+for (const w of workers) w.terminate();
+URL.revokeObjectURL(workerUrl);
+
+// Merge top 10 from all workers
+let top10 = [];
+for (const r of results) {
+  top10.push(...r.top10);
 }
+top10.sort((a, b) => b.total - a.total);
+top10 = top10.slice(0, 10);
 
 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+const rate = (totalChecked / ((Date.now() - startTime) / 1000) / 1_000_000).toFixed(1);
 
-if (matchCount === 0) {
-  console.error(`\n  ✗ No matches found in ${checked.toLocaleString()} salts (${elapsed}s).`);
+if (totalMatches === 0) {
+  console.error(`\n  ✗ No matches found in ${totalChecked.toLocaleString()} salts (${elapsed}s, ${rate}M/s).`);
   console.error("    Try relaxing your constraints (remove --peak, --dump, --shiny, etc.).\n");
   process.exit(1);
 }
 
+const matchCount = totalMatches;
+
 // ── Results ─────────────────────────────────────────────────────────────
 
 console.log(`\n${chalk.yellowBright("  " + "═".repeat(66))}`);
-console.log(chalk.bold(`  SCAN COMPLETE: `) + `${checked.toLocaleString()} salts in ${elapsed}s — ${matchCount.toLocaleString()} matches found`);
+console.log(chalk.bold(`  SCAN COMPLETE: `) + `${totalChecked.toLocaleString()} salts in ${elapsed}s (${rate}M/s, ${maxThreads} threads) — ${matchCount.toLocaleString()} matches`);
 console.log(chalk.yellowBright("  " + "═".repeat(66)));
 
 console.log(chalk.bold(`\n  TOP ${Math.min(10, top10.length)} RESULTS:\n`));
